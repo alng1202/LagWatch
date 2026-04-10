@@ -61,5 +61,7 @@ def ping():
 
         time.sleep(INTERVAL)
 
+
+# Uncomment to test ping function. Returns RTT
 if __name__ == "__main__":
     ping()
