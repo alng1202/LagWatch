@@ -1,7 +1,7 @@
 import sqlite3
 
-def write_metrics(data: dict):
-    conn = sqlite3.connect("lagwatch.db")  # ✅ thread-safe
+def write_metrics(data):
+    conn = sqlite3.connect("lagwatch.db")
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -23,5 +23,3 @@ def write_metrics(data: dict):
 
     conn.commit()
     conn.close()
-
-    print("✅ DB write successful")
