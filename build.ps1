@@ -1,3 +1,7 @@
+param(
+    [switch]$MainBuild
+)
+
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -44,11 +48,12 @@ $sourceFiles = @(
     (Join-Path $projectRoot 'AssemblyInfo.cs'),
     (Join-Path $projectRoot 'Program.cs'),
     (Join-Path $projectRoot 'Models.cs'),
+    (Join-Path $projectRoot 'OutageMap.cs'),
     (Join-Path $projectRoot 'Theme.cs'),
     (Join-Path $projectRoot 'LatencyChart.cs'),
     (Join-Path $projectRoot 'MainForm.cs')
 )
-$outputPath = Join-Path $projectRoot 'LagWatch.exe'
+$outputPath = Join-Path $projectRoot $(if ($MainBuild) { 'LagWatch.exe' } else { 'LagWatch-dev.exe' })
 $manifestPath = Join-Path $projectRoot 'app.manifest'
 
 $arguments = @(
@@ -65,6 +70,10 @@ $arguments = @(
     '/reference:System.Drawing.dll',
     '/reference:System.Windows.Forms.dll'
 ) + $sourceFiles
+
+if (-not $MainBuild) {
+    $arguments += '/define:DEV_BUILD'
+}
 
 & $compiler $arguments
 if ($LASTEXITCODE -ne 0) {

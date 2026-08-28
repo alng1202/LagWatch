@@ -41,6 +41,13 @@ namespace LagWatch
     internal sealed class AccentButton : Button
     {
         private bool primary;
+        private Color accentColor = Theme.Accent;
+
+        public Color AccentColor
+        {
+            get { return accentColor; }
+            set { accentColor = value; ApplyColors(); }
+        }
 
         public bool Primary
         {
@@ -75,9 +82,9 @@ namespace LagWatch
             }
             else if (primary)
             {
-                BackColor = Theme.Accent;
+                BackColor = accentColor;
                 ForeColor = Theme.Background;
-                FlatAppearance.BorderColor = Theme.Accent;
+                FlatAppearance.BorderColor = accentColor;
             }
             else
             {

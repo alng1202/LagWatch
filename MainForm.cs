@@ -26,13 +26,21 @@ namespace LagWatch
         private bool? lastReplySuccessful;
         private bool suppressGameSelection;
         private int lastAutoDetectedProcessId;
+        private string lastAutoServerTarget;
         private DateTime sessionStarted;
+        private readonly LatencyHistoryStore latencyHistory;
+        private DateTime lastGatewayEvidence = DateTime.MinValue;
+        private SubscriptionTier subscriptionTier = SubscriptionTier.Free;
 
         private ComboBox targetBox;
         private AccentButton monitorButton;
         private AccentButton optimizeButton;
         private AccentButton diagnoseButton;
         private AccentButton exportButton;
+        private AccentButton tierButton;
+        private AccentButton predictionsButton;
+        private AccentButton controllerButton;
+        private Label tierBanner;
         private Label statusBadge;
         private Label currentValue;
         private Label currentDetail;
@@ -64,6 +72,9 @@ namespace LagWatch
             KeyPreview = true;
 
             BuildInterface();
+            latencyHistory = new LatencyHistoryStore(Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory, "lagwatch-history.csv"));
+            ApplySubscriptionTier();
             RefreshGameProcesses(false);
 
             pingTimer = new Timer();
@@ -161,9 +172,18 @@ namespace LagWatch
             statusBadge.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             panel.Controls.Add(statusBadge);
 
+            tierBanner = new Label();
+            tierBanner.Text = "FREE · CORE NETWORK MONITOR";
+            tierBanner.AutoSize = true;
+            tierBanner.Font = new Font("Segoe UI Semibold", 8.5f);
+            tierBanner.ForeColor = Theme.TextMuted;
+            tierBanner.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            panel.Controls.Add(tierBanner);
+
             panel.Resize += delegate
             {
                 statusBadge.Location = new Point(panel.ClientSize.Width - statusBadge.Width, 5);
+                tierBanner.Location = new Point(panel.ClientSize.Width - tierBanner.Width, 38);
             };
             return panel;
         }
@@ -226,10 +246,41 @@ namespace LagWatch
             diagnoseButton.Click += async delegate { await DiagnoseAsync(); };
             bar.Controls.Add(diagnoseButton);
 
+#if DEV_BUILD
+            tierButton = new AccentButton();
+            tierButton.Text = "TIER: FREE";
+            tierButton.Width = 112;
+            tierButton.Margin = new Padding(8, 0, 0, 0);
+            tierButton.Click += delegate { CycleSubscriptionTier(); };
+            bar.Controls.Add(tierButton);
+#endif
+
+            predictionsButton = new AccentButton();
+            predictionsButton.Text = "PREDICTIONS";
+            predictionsButton.Width = 112;
+            predictionsButton.Margin = new Padding(8, 0, 0, 0);
+            predictionsButton.Click += delegate { ShowPredictionDataset(); };
+            bar.Controls.Add(predictionsButton);
+
+            controllerButton = new AccentButton();
+            controllerButton.Text = "OUTAGE MAP";
+            controllerButton.Width = 116;
+            controllerButton.Margin = new Padding(8, 0, 0, 0);
+            controllerButton.Click += delegate
+            {
+                using (OutageMapForm outageMap = new OutageMapForm()) outageMap.ShowDialog(this);
+            };
+            bar.Controls.Add(controllerButton);
+
             ToolTip tips = new ToolTip();
             tips.SetToolTip(targetBox, "IP address or host name. For the best result, use your game server when known.");
             tips.SetToolTip(optimizeButton, "Flushes the Windows DNS cache and raises the selected game's process priority.");
             tips.SetToolTip(diagnoseButton, "Checks the active adapter, gateway, DNS, link speed, and target response.");
+#if DEV_BUILD
+            tips.SetToolTip(tierButton, "Developer build: cycle through Free, Basic, and Pro entitlements.");
+#endif
+            tips.SetToolTip(predictionsButton, "Inspect local prediction training data and readiness.");
+            tips.SetToolTip(controllerButton, "Detect your ISP and inspect local, provider, and global outage signals.");
             return bar;
         }
 
@@ -603,6 +654,9 @@ namespace LagWatch
             lastReplySuccessful = sample.Success;
 
             samples.Add(sample);
+            try { latencyHistory.Record(sample.Timestamp, targetBox.Text.Trim(), sample.Success, sample.LatencyMs); }
+            catch (IOException) { }
+            await RecordGatewayEvidenceAsync(sample.Timestamp);
             if (samples.Count > 600)
                 samples.RemoveAt(0);
             chart.SetSamples(samples);
@@ -621,7 +675,24 @@ namespace LagWatch
             lossValue.Text = snapshot.LossPercent.ToString("0.0") + "%";
             lossValue.ForeColor = MetricColor(snapshot.LossPercent, 2, 5);
             averageDetail.Text = snapshot.SuccessfulSamples + " successful samples";
-            currentDetail.Text = snapshot.CurrentMs < 0 ? "no ICMP reply" : "latest reply";
+            if (snapshot.CurrentMs < 0)
+                currentDetail.Text = "no ICMP reply";
+            else
+            {
+                if (!SubscriptionPolicy.CanUsePredictions(subscriptionTier))
+                    currentDetail.Text = "latest reply · prediction in Basic";
+                else
+                {
+                    LatencyPrediction prediction = null;
+                    try { prediction = latencyHistory.Predict(DateTime.Now, targetBox.Text.Trim()); }
+                    catch (IOException) { }
+                    currentDetail.Text = prediction != null && prediction.Ready
+                        ? (prediction.FailurePercent >= 10
+                            ? "historical instability risk · " + prediction.FailurePercent.ToString("0") + "% failures"
+                            : "expected now ≈ " + prediction.ExpectedMs.ToString("0") + " ms")
+                        : "prediction learning locally";
+                }
+            }
             sessionSamples.Text = snapshot.TotalSamples.ToString(CultureInfo.InvariantCulture);
 
             Color qualityColor = Theme.TextMuted;
@@ -702,6 +773,11 @@ namespace LagWatch
 
         private async Task DiagnoseAsync()
         {
+            if (!SubscriptionPolicy.CanUseAdvancedDiagnostics(subscriptionTier))
+            {
+                ShowTierRequirement("Advanced diagnostics", SubscriptionTier.Pro);
+                return;
+            }
             string target = targetBox.Text.Trim();
             if (!TargetValidator.IsValid(target))
             {
@@ -829,6 +905,7 @@ namespace LagWatch
 
             gameDetectionStatus.Text = "Detected · " + detected.ProcessName + " · " + detected.DetectionReason;
             gameDetectionStatus.ForeColor = Theme.Good;
+            TryUseDetectedGameServer(detected);
             if (lastAutoDetectedProcessId != detected.ProcessId)
             {
                 AppendLog("Game auto-detected: " + detected.DisplayName + " [" + detected.DetectionReason + "].", Theme.Good);
@@ -836,8 +913,41 @@ namespace LagWatch
             }
         }
 
+        private void TryUseDetectedGameServer(GameProcessOption game)
+        {
+            GameServerEndpoint endpoint;
+            try { endpoint = GameServerDiscovery.FindBestEndpoint(game.ProcessId); }
+            catch { return; }
+            if (endpoint == null)
+            {
+                if (lastAutoDetectedProcessId != game.ProcessId)
+                    AppendLog("No public TCP endpoint is visible for " + game.ProcessName +
+                        ". UDP server discovery requires the native WFP telemetry component.", Theme.TextFaint);
+                return;
+            }
+            if (String.Equals(lastAutoServerTarget, endpoint.Address, StringComparison.OrdinalIgnoreCase)) return;
+
+            string oldTarget = targetBox.Text.Trim();
+            lastAutoServerTarget = endpoint.Address;
+            targetBox.Text = endpoint.Address;
+            if (monitoring && !String.Equals(oldTarget, endpoint.Address, StringComparison.OrdinalIgnoreCase))
+            {
+                samples.Clear(); chart.SetSamples(samples); lastReplySuccessful = null;
+                sessionTarget.Text = endpoint.Address; sessionSamples.Text = "0";
+            }
+            gameDetectionStatus.Text = "Detected · " + game.ProcessName + " · " + endpoint.Protocol +
+                " server " + endpoint.Address + ":" + endpoint.Port;
+            AppendLog("Game endpoint discovered → " + endpoint.Address + ":" + endpoint.Port +
+                " (ICMP reference; game transport latency may differ).", Theme.Accent);
+        }
+
         private void ExportCsv()
         {
+            if (!SubscriptionPolicy.CanExportHistory(subscriptionTier))
+            {
+                ShowTierRequirement("Session export", SubscriptionTier.Basic);
+                return;
+            }
             if (samples.Count == 0)
             {
                 MessageBox.Show(this, "There are no samples to export yet.", "Nothing to export",
@@ -888,6 +998,123 @@ namespace LagWatch
                 e.SuppressKeyPress = true;
                 ExportCsv();
             }
+        }
+
+        private void CycleSubscriptionTier()
+        {
+            subscriptionTier = subscriptionTier == SubscriptionTier.Free
+                ? SubscriptionTier.Basic
+                : subscriptionTier == SubscriptionTier.Basic ? SubscriptionTier.Pro : SubscriptionTier.Free;
+            ApplySubscriptionTier();
+        }
+
+        private void ApplySubscriptionTier()
+        {
+            if (tierButton != null)
+                tierButton.Text = "TIER: " + subscriptionTier.ToString().ToUpperInvariant();
+            predictionsButton.Visible = subscriptionTier != SubscriptionTier.Free;
+            controllerButton.Visible = subscriptionTier == SubscriptionTier.Pro;
+            diagnoseButton.Text = SubscriptionPolicy.CanUseAdvancedDiagnostics(subscriptionTier)
+                ? "DIAGNOSE" : "DIAGNOSE 🔒";
+            exportButton.Text = SubscriptionPolicy.CanExportHistory(subscriptionTier)
+                ? "EXPORT CSV  [CTRL+E]" : "EXPORT CSV 🔒";
+            Color identity;
+            if (subscriptionTier == SubscriptionTier.Basic)
+            {
+                identity = Color.FromArgb(167, 139, 250);
+                tierBanner.Text = "BASIC · PREDICTIVE LATENCY INTELLIGENCE";
+            }
+            else if (subscriptionTier == SubscriptionTier.Pro)
+            {
+                identity = Color.FromArgb(251, 191, 36);
+                tierBanner.Text = "PRO · ADAPTIVE CONTROL LAB";
+            }
+            else
+            {
+                identity = Theme.Accent;
+                tierBanner.Text = "FREE · CORE NETWORK MONITOR";
+            }
+            tierBanner.ForeColor = identity;
+            if (tierButton != null) tierButton.AccentColor = identity;
+            predictionsButton.AccentColor = identity;
+            controllerButton.AccentColor = identity;
+            if (tierButton != null) tierButton.Primary = true;
+            predictionsButton.Primary = true;
+            controllerButton.Primary = true;
+            AppendLog("Developer tier switched to " + subscriptionTier.ToString().ToUpperInvariant() +
+                " · " + SubscriptionPolicy.Summary(subscriptionTier) + ".", Theme.AccentBlue);
+            if (subscriptionTier == SubscriptionTier.Pro)
+                AppendLog("Adaptive traffic control is a monitor-only preview; no Windows network limits are applied.", Theme.Warning);
+            if (monitoring) UpdateMetrics();
+        }
+
+        private void ShowPredictionDataset()
+        {
+            if (!SubscriptionPolicy.CanUsePredictions(subscriptionTier))
+            {
+                ShowTierRequirement("Historical predictions", SubscriptionTier.Basic);
+                return;
+            }
+            string target = targetBox.Text.Trim(); HistoryDatasetStats stats;
+            try { stats = latencyHistory.GetStats(target); }
+            catch (IOException ex)
+            {
+                MessageBox.Show(this, ex.Message, "Could not read prediction data",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error); return;
+            }
+            string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "lagwatch-history.csv");
+            LatencyPrediction prediction = latencyHistory.Predict(DateTime.Now, target);
+            LatencyPrediction gatewayPrediction = latencyHistory.Predict(DateTime.Now, "__local_gateway__");
+            string readiness = prediction.Ready
+                ? "Ready · expected now ≈ " + prediction.ExpectedMs.ToString("0") + " ms"
+                : "Learning · requires 12 matching time-window samples across at least 3 prior days";
+            MessageBox.Show(this, "LOCAL TRAINING DATA\n\nStored at:\n" + path +
+                "\n\nAll samples: " + stats.TotalSamples +
+                "\nCurrent target samples: " + stats.TargetSamples +
+                "\nCurrent target days: " + stats.TargetDays +
+                "\nHistorical target failure rate now: " + prediction.FailurePercent.ToString("0.0") + "%" +
+                "\nHistorical gateway failure rate now: " + gatewayPrediction.FailurePercent.ToString("0.0") + "%" +
+                "\n\n" + readiness +
+                "\n\nLagWatch currently uses a robust time-of-day median predictor, not a neural network.",
+                "Prediction dataset", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private async Task RecordGatewayEvidenceAsync(DateTime timestamp)
+        {
+            if (lastGatewayEvidence.Date == timestamp.Date && lastGatewayEvidence.Hour == timestamp.Hour &&
+                lastGatewayEvidence.Minute == timestamp.Minute) return;
+            lastGatewayEvidence = timestamp;
+            string gateway = null;
+            try
+            {
+                gateway = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(n => n.OperationalStatus == OperationalStatus.Up)
+                    .SelectMany(n => n.GetIPProperties().GatewayAddresses)
+                    .Select(g => g.Address.ToString()).FirstOrDefault();
+            }
+            catch { }
+            bool success = false; long latency = 0;
+            if (!String.IsNullOrWhiteSpace(gateway))
+            {
+                try
+                {
+                    using (Ping ping = new Ping())
+                    {
+                        PingReply reply = await ping.SendPingAsync(gateway, 900);
+                        success = reply.Status == IPStatus.Success; latency = success ? reply.RoundtripTime : 0;
+                    }
+                }
+                catch { }
+            }
+            try { latencyHistory.Record(timestamp, "__local_gateway__", success, latency); }
+            catch (IOException) { }
+        }
+
+        private void ShowTierRequirement(string feature, SubscriptionTier required)
+        {
+            MessageBox.Show(this, feature + " requires " + required + " in this developer demo.\n\n" +
+                "Use the tier button in the toolbar to switch plans.", "Tier feature",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         private void SetStatus(string text, Color color)

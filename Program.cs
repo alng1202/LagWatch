@@ -61,6 +61,31 @@ namespace LagWatch
             check(TargetValidator.IsValid("2606:4700:4700::1111"), "IPv6 target validation");
             check(!TargetValidator.IsValid("https://example.com/path"), "URL rejected as ping target");
             check(!TargetValidator.IsValid("example.com:443"), "host with port rejected");
+            check(GameServerDiscovery.IsPublicAddress(System.Net.IPAddress.Parse("8.8.8.8")),
+                "public game endpoint accepted");
+            check(!GameServerDiscovery.IsPublicAddress(System.Net.IPAddress.Parse("192.168.1.10")),
+                "private endpoint rejected");
+            check(!SubscriptionPolicy.CanUsePredictions(SubscriptionTier.Free) &&
+                SubscriptionPolicy.CanUsePredictions(SubscriptionTier.Basic), "prediction tier policy");
+            check(!SubscriptionPolicy.CanUseAdvancedDiagnostics(SubscriptionTier.Basic) &&
+                SubscriptionPolicy.CanUseAdvancedDiagnostics(SubscriptionTier.Pro), "diagnostic tier policy");
+            check(OutageMapForm.NormalizeProvider("COMCAST-7922 - Comcast Cable").Equals("Comcast"),
+                "consumer ISP name normalization");
+            check(OutageMapForm.ClassifyOffline(true, true, false, false, false) ==
+                "ISP_OR_UPSTREAM_OUTAGE_SUSPECTED", "offline ISP outage inference");
+            check(OutageMapForm.ClassifyOffline(false, false, false, false, false) ==
+                "LOCAL_ADAPTER_OUTAGE", "offline local outage inference");
+            string retentionTest = Path.Combine(Path.GetTempPath(), "lagwatch-retention-" + Guid.NewGuid().ToString("N") + ".csv");
+            try
+            {
+                File.WriteAllText(retentionTest, "timestamp,target,latency_ms\n" +
+                    DateTime.Now.AddDays(-31).ToString("o", CultureInfo.InvariantCulture) + ",\"test\",90\n" +
+                    DateTime.Now.AddDays(-5).ToString("o", CultureInfo.InvariantCulture) + ",\"test\",20\n");
+                new LatencyHistoryStore(retentionTest).Record(DateTime.Now, "test", 21);
+                string retained = File.ReadAllText(retentionTest);
+                check(!retained.Contains(",90") && retained.Contains(",20"), "30-day prediction retention");
+            }
+            finally { try { File.Delete(retentionTest); } catch { } }
             check(GameProcessService.ScoreCandidate("cs2", @"C:\Games\cs2.exe") >= 100,
                 "known game auto-detection");
             check(GameProcessService.ScoreCandidate("ExampleGame", @"D:\Steam\steamapps\common\Example\game.exe") >= 70,

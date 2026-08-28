@@ -6,11 +6,41 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 
 namespace LagWatch
 {
+    internal enum SubscriptionTier
+    {
+        Free,
+        Basic,
+        Pro
+    }
+
+    internal static class SubscriptionPolicy
+    {
+        public static bool CanUsePredictions(SubscriptionTier tier) { return (int)tier >= (int)SubscriptionTier.Basic; }
+        public static bool CanExportHistory(SubscriptionTier tier) { return (int)tier >= (int)SubscriptionTier.Basic; }
+        public static bool CanUseAdvancedDiagnostics(SubscriptionTier tier) { return (int)tier >= (int)SubscriptionTier.Pro; }
+        public static bool CanPreviewAdaptiveControl(SubscriptionTier tier) { return (int)tier >= (int)SubscriptionTier.Pro; }
+
+        public static string Summary(SubscriptionTier tier)
+        {
+            switch (tier)
+            {
+                case SubscriptionTier.Basic:
+                    return "Predictions and session exports unlocked";
+                case SubscriptionTier.Pro:
+                    return "Advanced diagnostics and adaptive-control preview unlocked";
+                default:
+                    return "Monitoring, game detection, graph, and Safe Optimize";
+            }
+        }
+    }
+
     internal sealed class PingSample
     {
         public DateTime Timestamp { get; set; }
@@ -253,6 +283,241 @@ namespace LagWatch
             if (path.Contains("ubisoft")) return "Ubisoft game folder";
             if (score >= 80) return "game engine executable";
             return "visible application";
+        }
+    }
+
+    internal sealed class GameServerEndpoint
+    {
+        public string Address { get; set; }
+        public int Port { get; set; }
+        public string Protocol { get; set; }
+    }
+
+    internal static class GameServerDiscovery
+    {
+        private const int AfInet = 2;
+        private const int TcpTableOwnerPidAll = 5;
+        private const int ErrorInsufficientBuffer = 122;
+        private const uint Established = 5;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TcpRow
+        {
+            public uint State;
+            public uint LocalAddress;
+            public uint LocalPort;
+            public uint RemoteAddress;
+            public uint RemotePort;
+            public uint OwningPid;
+        }
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedTcpTable(IntPtr table, ref int size,
+            bool order, int addressFamily, int tableClass, uint reserved);
+
+        public static GameServerEndpoint FindBestEndpoint(int processId)
+        {
+            if (processId <= 0) return null;
+            List<GameServerEndpoint> endpoints = GetTcpEndpoints(processId);
+            return endpoints
+                // Web endpoints are commonly launchers, auth, telemetry, or CDNs rather
+                // than the active match server. Do not silently present one as game RTT.
+                .Where(e => e.Port != 80 && e.Port != 443)
+                .OrderBy(e => e.Address, StringComparer.Ordinal)
+                .FirstOrDefault();
+        }
+
+        private static List<GameServerEndpoint> GetTcpEndpoints(int processId)
+        {
+            List<GameServerEndpoint> result = new List<GameServerEndpoint>();
+            int size = 0;
+            uint first = GetExtendedTcpTable(IntPtr.Zero, ref size, true, AfInet,
+                TcpTableOwnerPidAll, 0);
+            if (first != ErrorInsufficientBuffer || size <= 0) return result;
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                if (GetExtendedTcpTable(buffer, ref size, true, AfInet,
+                    TcpTableOwnerPidAll, 0) != 0) return result;
+                int count = Marshal.ReadInt32(buffer);
+                IntPtr rowPointer = IntPtr.Add(buffer, sizeof(int));
+                int rowSize = Marshal.SizeOf(typeof(TcpRow));
+                for (int i = 0; i < count; i++)
+                {
+                    TcpRow row = (TcpRow)Marshal.PtrToStructure(
+                        IntPtr.Add(rowPointer, i * rowSize), typeof(TcpRow));
+                    if (row.OwningPid != (uint)processId || row.State != Established) continue;
+                    IPAddress address = new IPAddress(row.RemoteAddress);
+                    if (!IsPublicAddress(address)) continue;
+                    result.Add(new GameServerEndpoint
+                    {
+                        Address = address.ToString(),
+                        Port = DecodePort(row.RemotePort),
+                        Protocol = "TCP"
+                    });
+                }
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+            return result;
+        }
+
+        private static int DecodePort(uint value)
+        {
+            byte[] bytes = BitConverter.GetBytes(value);
+            return (bytes[0] << 8) + bytes[1];
+        }
+
+        internal static bool IsPublicAddress(IPAddress address)
+        {
+            if (address == null || address.AddressFamily != AddressFamily.InterNetwork) return false;
+            byte[] b = address.GetAddressBytes();
+            if (b[0] == 10 || b[0] == 127 || b[0] == 0 || b[0] >= 224) return false;
+            if (b[0] == 169 && b[1] == 254) return false;
+            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return false;
+            if (b[0] == 192 && b[1] == 168) return false;
+            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return false;
+            return true;
+        }
+    }
+
+    internal sealed class LatencyPrediction
+    {
+        public bool Ready { get; set; }
+        public double ExpectedMs { get; set; }
+        public int SampleCount { get; set; }
+        public int DayCount { get; set; }
+        public double FailurePercent { get; set; }
+    }
+
+    internal sealed class HistoryDatasetStats
+    {
+        public int TotalSamples { get; set; }
+        public int TargetSamples { get; set; }
+        public int TargetDays { get; set; }
+    }
+
+    internal sealed class LatencyHistoryStore
+    {
+        private readonly string path;
+        private readonly Dictionary<string, DateTime> lastWrites = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private DateTime lastPrune = DateTime.MinValue;
+
+        public LatencyHistoryStore(string path) { this.path = path; }
+
+        public void Record(DateTime timestamp, string target, long latencyMs)
+        {
+            Record(timestamp, target, true, latencyMs);
+        }
+
+        public void Record(DateTime timestamp, string target, bool success, long latencyMs)
+        {
+            if (lastPrune.Date != timestamp.Date)
+            {
+                Prune(timestamp.AddDays(-30));
+                lastPrune = timestamp.Date;
+            }
+            // One local training point per minute avoids an unnecessarily large file.
+            DateTime lastWrite;
+            if (lastWrites.TryGetValue(target ?? "", out lastWrite) && lastWrite.Date == timestamp.Date &&
+                lastWrite.Hour == timestamp.Hour && lastWrite.Minute == timestamp.Minute) return;
+            bool writeHeader = !File.Exists(path);
+            using (StreamWriter writer = new StreamWriter(path, true, new UTF8Encoding(false)))
+            {
+                if (writeHeader) writer.WriteLine("timestamp,target,success,latency_ms");
+                writer.WriteLine(timestamp.ToString("o", CultureInfo.InvariantCulture) + "," +
+                    Escape(target) + "," + (success ? "true" : "false") + "," +
+                    (success ? latencyMs.ToString(CultureInfo.InvariantCulture) : ""));
+            }
+            lastWrites[target ?? ""] = timestamp;
+        }
+
+        private void Prune(DateTime cutoff)
+        {
+            if (!File.Exists(path)) return;
+            string temporary = path + ".pruning";
+            using (StreamWriter writer = new StreamWriter(temporary, false, new UTF8Encoding(false)))
+            {
+                writer.WriteLine("timestamp,target,success,latency_ms");
+                foreach (string line in File.ReadLines(path).Skip(1))
+                {
+                    string[] parts = Parse(line); DateTime timestamp;
+                    if ((parts.Length == 3 || parts.Length == 4) && DateTime.TryParse(parts[0], CultureInfo.InvariantCulture,
+                        DateTimeStyles.RoundtripKind, out timestamp) && timestamp >= cutoff)
+                        writer.WriteLine(line);
+                }
+            }
+            try { File.Replace(temporary, path, null); }
+            catch (PlatformNotSupportedException) { File.Delete(path); File.Move(temporary, path); }
+        }
+
+        public LatencyPrediction Predict(DateTime when, string target)
+        {
+            LatencyPrediction prediction = new LatencyPrediction();
+            if (!File.Exists(path)) return prediction;
+            List<double> values = new List<double>();
+            HashSet<DateTime> days = new HashSet<DateTime>();
+            int observations = 0; int failures = 0;
+            foreach (string line in File.ReadLines(path).Skip(1))
+            {
+                string[] parts = Parse(line);
+                DateTime timestamp; double latency = 0; bool success = true;
+                if ((parts.Length != 3 && parts.Length != 4) || !DateTime.TryParse(parts[0], CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out timestamp)) continue;
+                if (parts.Length == 4) Boolean.TryParse(parts[2], out success);
+                string latencyText = parts.Length == 4 ? parts[3] : parts[2];
+                if (success && !Double.TryParse(latencyText, NumberStyles.Float, CultureInfo.InvariantCulture, out latency)) continue;
+                if (!String.Equals(parts[1], target, StringComparison.OrdinalIgnoreCase)) continue;
+                int distance = (int)Math.Abs(timestamp.TimeOfDay.TotalMinutes - when.TimeOfDay.TotalMinutes);
+                distance = Math.Min(distance, 1440 - distance);
+                if (timestamp.Date != when.Date && distance <= 15)
+                {
+                    observations++;
+                    if (success) values.Add(latency); else failures++;
+                    days.Add(timestamp.Date);
+                }
+            }
+            prediction.SampleCount = observations; prediction.DayCount = days.Count;
+            prediction.FailurePercent = observations == 0 ? 0 : 100.0 * failures / observations;
+            if (observations >= 12 && days.Count >= 3 && values.Count > 0)
+            {
+                values.Sort(); prediction.ExpectedMs = values[values.Count / 2]; prediction.Ready = true;
+            }
+            return prediction;
+        }
+
+        public HistoryDatasetStats GetStats(string target)
+        {
+            HistoryDatasetStats stats = new HistoryDatasetStats();
+            if (!File.Exists(path)) return stats;
+            HashSet<DateTime> days = new HashSet<DateTime>();
+            foreach (string line in File.ReadLines(path).Skip(1))
+            {
+                string[] parts = Parse(line); DateTime timestamp;
+                if ((parts.Length != 3 && parts.Length != 4) || !DateTime.TryParse(parts[0], CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out timestamp)) continue;
+                stats.TotalSamples++;
+                if (String.Equals(parts[1], target, StringComparison.OrdinalIgnoreCase))
+                {
+                    stats.TargetSamples++; days.Add(timestamp.Date);
+                }
+            }
+            stats.TargetDays = days.Count;
+            return stats;
+        }
+
+        private static string Escape(string value) { return "\"" + (value ?? "").Replace("\"", "\"\"") + "\""; }
+        private static string[] Parse(string line)
+        {
+            List<string> fields = new List<string>(); StringBuilder value = new StringBuilder(); bool quoted = false;
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (c == '\"' && quoted && i + 1 < line.Length && line[i + 1] == '\"') { value.Append('\"'); i++; }
+                else if (c == '\"') quoted = !quoted;
+                else if (c == ',' && !quoted) { fields.Add(value.ToString()); value.Clear(); }
+                else value.Append(c);
+            }
+            fields.Add(value.ToString()); return fields.ToArray();
         }
     }
 
