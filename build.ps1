@@ -1,19 +1,33 @@
 param(
-    [switch]$MainBuild
+    # Production exe (LagWatch.exe) without the developer tier selector. Default is the dev build (LagWatch-dev.exe).
+    [switch]$MainBuild,
+    # Framework-dependent exe (~1 MB, needs the .NET 8 Desktop Runtime) instead of a self-contained single file.
+    [switch]$Small,
+    # Skip the built-in self-tests after building.
+    [switch]$NoTest
 )
 
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$compilerCandidates = @(
-    'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe',
-    'C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe'
-)
-$compiler = $compilerCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-if (-not $compiler) {
-    throw 'The Windows .NET Framework C# compiler was not found.'
-}
+$project = Join-Path $projectRoot 'LagWatch.csproj'
 
+# LagWatch + NetFix needs the .NET 8 SDK (NetFix's engine uses C# 12 and WinRT). Use a per-user install if present.
+$dotnetCandidates = @(
+    (Join-Path $env:USERPROFILE '.dotnet\dotnet.exe'),
+    'C:\Program Files\dotnet\dotnet.exe'
+)
+$dotnet = $null
+foreach ($candidate in $dotnetCandidates) {
+    if ((Test-Path -LiteralPath $candidate) -and ((& $candidate --list-sdks) -match '^8\.')) { $dotnet = $candidate; break }
+}
+if (-not $dotnet) {
+    throw 'The .NET 8 SDK was not found. Install it, or per user with: dotnet-install.ps1 -Channel 8.0'
+}
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+$env:DOTNET_NOLOGO = '1'
+
+# App icon, drawn from code (unchanged from the original LagWatch build).
 $iconPath = Join-Path $projectRoot 'LagWatch.ico'
 Add-Type -AssemblyName System.Drawing
 $bitmap = New-Object System.Drawing.Bitmap 64, 64
@@ -44,41 +58,39 @@ $accentBrush.Dispose()
 $graphics.Dispose()
 $bitmap.Dispose()
 
-$sourceFiles = @(
-    (Join-Path $projectRoot 'AssemblyInfo.cs'),
-    (Join-Path $projectRoot 'Program.cs'),
-    (Join-Path $projectRoot 'Models.cs'),
-    (Join-Path $projectRoot 'OutageMap.cs'),
-    (Join-Path $projectRoot 'Theme.cs'),
-    (Join-Path $projectRoot 'LatencyChart.cs'),
-    (Join-Path $projectRoot 'MainForm.cs')
-)
-$outputPath = Join-Path $projectRoot $(if ($MainBuild) { 'LagWatch.exe' } else { 'LagWatch-dev.exe' })
-$manifestPath = Join-Path $projectRoot 'app.manifest'
+$exeName = $(if ($MainBuild) { 'LagWatch.exe' } else { 'LagWatch-dev.exe' })
+$outputPath = Join-Path $projectRoot $exeName
+$publishDir = Join-Path $projectRoot ("bin\publish\" + $(if ($MainBuild) { 'main' } else { 'dev' }))
+$mainFlag = $(if ($MainBuild) { 'true' } else { 'false' })
 
 $arguments = @(
-    '/nologo',
-    '/target:winexe',
-    '/platform:x64',
-    '/optimize+',
-    '/debug-',
-    "/out:$outputPath",
-    "/win32icon:$iconPath",
-    "/win32manifest:$manifestPath",
-    '/reference:System.dll',
-    '/reference:System.Core.dll',
-    '/reference:System.Drawing.dll',
-    '/reference:System.Windows.Forms.dll'
-) + $sourceFiles
-
-if (-not $MainBuild) {
-    $arguments += '/define:DEV_BUILD'
+    'publish', $project,
+    '-c', 'Release',
+    '-r', 'win-x64',
+    '-o', $publishDir,
+    "-p:LagWatchMainBuild=$mainFlag",
+    '-p:PublishSingleFile=true',
+    '-p:DebugType=none',
+    '-nologo', '-v', 'q'
+)
+if ($Small) {
+    $arguments += '--self-contained', 'false'
+} else {
+    $arguments += '--self-contained', 'true', '-p:IncludeNativeLibrariesForSelfExtract=true', '-p:EnableCompressionInSingleFile=true'
 }
 
-& $compiler $arguments
+& $dotnet $arguments
 if ($LASTEXITCODE -ne 0) {
-    throw "LagWatch build failed with compiler exit code $LASTEXITCODE."
+    throw "LagWatch build failed with exit code $LASTEXITCODE."
 }
 
+Copy-Item -LiteralPath (Join-Path $publishDir 'LagWatch.exe') -Destination $outputPath -Force
 $file = Get-Item -LiteralPath $outputPath
-Write-Host "Built $($file.FullName) ($([Math]::Round($file.Length / 1KB, 1)) KB)"
+Write-Host "Built $($file.FullName) ($([Math]::Round($file.Length / 1MB, 1)) MB)"
+
+if (-not $NoTest) {
+    $report = Join-Path $projectRoot 'self-test-report.txt'
+    $process = Start-Process -FilePath $outputPath -ArgumentList '--self-test', '--report', "`"$report`"" -Wait -PassThru
+    Get-Content -LiteralPath $report | Write-Host
+    if ($process.ExitCode -ne 0) { throw 'LagWatch self-tests failed.' }
+}

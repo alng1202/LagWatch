@@ -1,0 +1,14 @@
+# Local SDK and build outputs
+.dotnet-sdk/
+bin/
+obj/
+Tests/bin/
+Tests/obj/
+
+# Python and local runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Local editor state
+.vscode/*
+!.vscode/settings.json

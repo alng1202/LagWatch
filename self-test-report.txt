@@ -1,0 +1,33 @@
+LagWatch self-test 2026-11-13T02:59:52.9459444-08:00
+PASS  IPv4 target validation
+PASS  DNS target validation
+PASS  IPv6 target validation
+PASS  URL rejected as ping target
+PASS  host with port rejected
+PASS  public game endpoint accepted
+PASS  private endpoint rejected
+PASS  prediction tier policy
+PASS  diagnostic tier policy
+PASS  free tier keeps safe NetFix fixes
+PASS  plus tier unlocks network repair fixes
+PASS  pro tier policy
+PASS  no admin-level NetFix repair is in the free tier
+PASS  NetFix offline rule: only layers 5-7 need the internet
+PASS  consumer ISP name normalization
+PASS  registry handle is dropped from the ISP name
+PASS  route map hop device labels
+PASS  offline ISP outage inference
+PASS  offline local outage inference
+PASS  30-day prediction retention
+PASS  known game auto-detection
+PASS  Steam path auto-detection
+PASS  desktop app excluded from game detection
+PASS  Windows startup command
+PASS  theme preset normalization
+PASS  sample counting
+PASS  success counting
+PASS  average calculation
+PASS  jitter calculation
+PASS  packet-loss calculation
+PASS  quality classification
+ALL TESTS PASSED

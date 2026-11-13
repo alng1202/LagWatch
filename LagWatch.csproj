@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    LagWatch + NetFix (Windows). One WinForms app on .NET 8:
+      *.cs              LagWatch monitor, charts, outage center, optimizer (WinForms UI)
+      NetFix/Model      NetFix's plain-language Issue/Fix model and OSI layer rules (unchanged from Netfix for Windows)
+      NetFix/Diagnostics NetFix's checks and one-click fixes (unchanged from Netfix for Windows)
+      Doctor/           the WinForms screens and tier policy that put NetFix inside LagWatch
+    Build with build.ps1 (dev build by default, -MainBuild for the production exe).
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- 10.0.19041: Windows 10 2004+, needed by NetFix's WinRT radio API (Turn Wi-Fi on / Bluetooth on). -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- NetFix sources carry nullable annotations; LagWatch sources predate them. Allow both without warnings. -->
+    <Nullable>annotations</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>LagWatch</RootNamespace>
+    <AssemblyName>LagWatch</AssemblyName>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon Condition="Exists('LagWatch.ico')">LagWatch.ico</ApplicationIcon>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- WebClient / legacy APIs used by the LagWatch outage center. -->
+    <NoWarn>$(NoWarn);SYSLIB0014;CA1416;WFAC010</NoWarn>
+  </PropertyGroup>
+
+  <!-- Dev build (default): adds the FREE/PLUS/PRO tier selector. build.ps1 -MainBuild passes LagWatchMainBuild=true. -->
+  <PropertyGroup Condition="'$(LagWatchMainBuild)' != 'true'">
+    <DefineConstants>$(DefineConstants);DEV_BUILD</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Tests\**" />
+    <None Remove="Tests\**" />
+  </ItemGroup>
+
+</Project>

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Diagnostics;
 using System.IO;
@@ -11,8 +11,18 @@ using System.Windows.Forms;
 
 namespace LagWatch
 {
-    internal sealed class OutageMapForm : Form
+    internal sealed class OutageMapForm : Form, IEmbeddedTool
     {
+        private bool started;
+
+        /// <summary>Starts the tool's work once, whether it opens as a window (Shown) or as a page in the main window.</summary>
+        public async System.Threading.Tasks.Task StartAsync()
+        {
+            if (started || IsDisposed) return;
+            started = true;
+            await RefreshAsync();
+        }
+
         private readonly Label ispValue;
         private readonly Label localValue;
         private readonly Label providerValue;
@@ -26,13 +36,14 @@ namespace LagWatch
 
         public OutageMapForm()
         {
+            Theme.BeginDpiLayout(this);
             Text = "LagWatch Pro — Outage Map";
             StartPosition = FormStartPosition.CenterParent;
             Size = new Size(760, 555);
             MinimumSize = new Size(680, 470);
             BackColor = Theme.Background;
             ForeColor = Theme.Text;
-            Font = new Font("Segoe UI", 9f);
+            Font = Theme.UiFont(9f);
 
             Label title = MakeLabel("OUTAGE MAP", 26, 22, 16, Theme.Text);
             Label subtitle = MakeLabel("LOCAL DEVICE  →  ISP EDGE  →  GLOBAL INTERNET", 26, 52, 9, Theme.TextMuted);
@@ -63,8 +74,13 @@ namespace LagWatch
             refreshButton.Location = new Point(ClientSize.Width - 206, 437);
             refreshButton.Click += async delegate { await RefreshAsync(); };
             Controls.Add(refreshButton);
-            Resize += delegate { refreshButton.Left = ClientSize.Width - 206; card.Width = ClientSize.Width - 52; };
-            Shown += async delegate { await RefreshAsync(); };
+            Resize += delegate
+            {
+                refreshButton.Left = ClientSize.Width - refreshButton.Width - Theme.Px(this, 26);
+                card.Width = ClientSize.Width - Theme.Px(this, 52);
+            };
+            Shown += async delegate { await StartAsync(); };
+            Theme.EndDpiLayout(this);
         }
 
         private async Task RefreshAsync()
@@ -92,10 +108,12 @@ namespace LagWatch
                     : (dns ? "DEGRADED · DNS works but probes fail" : "POSSIBLE ISP / UPSTREAM OUTAGE");
                 providerValue.ForeColor = cloudflare || google ? Theme.Good : Theme.Warning;
                 globalValue.Text = await QueryIodaWithCacheAsync(isp);
-                OutageHistory history = new OutageHistory();
-                history.Record(DateTime.Now, diagnosis);
-                offlineRiskValue.Text = "OFFLINE PREDICTION · " + history.GetRecurringWarning(DateTime.Now);
-                offlineRiskValue.ForeColor = diagnosis == "HEALTHY" ? Theme.TextMuted : Theme.Warning;
+                // The outlook comes from the always-on connection history, not just from visits to this page.
+                DateTime now = DateTime.Now;
+                RiskOutlook outlook = await Task.Run(() => RiskForecaster.Forecast(
+                    new HealthHistory(HealthHistory.DefaultPath).Load(now.AddDays(-HealthHistory.KeepDays)), now, 12));
+                offlineRiskValue.Text = "NEXT 12 HOURS · " + HeadsUpText.OutlookSummary(outlook);
+                offlineRiskValue.ForeColor = outlook.Windows.Count > 0 || diagnosis != "HEALTHY" ? Theme.Warning : Theme.TextMuted;
                 plannedValue.Text = providerStatusUrl == null
                     ? "No free provider feed found · use your ISP account/app"
                     : "Available through the official ISP status center (service address/sign-in required)";
@@ -110,7 +128,7 @@ namespace LagWatch
             finally { refreshButton.Enabled = true; }
         }
 
-        private static async Task<string> DetectIspWithCacheAsync()
+        internal static async Task<string> DetectIspWithCacheAsync()
         {
             string cache = CachePath("isp.txt");
             try
@@ -118,7 +136,7 @@ namespace LagWatch
                 using (WebClient client = NewClient())
                 {
                     string json = await client.DownloadStringTaskAsync("https://asn.ipinfo.app/api/json/myasn");
-                    Match asn = Regex.Match(json, "\\\"asn\\\"\\s*:\\s*(\\d+)");
+                    Match asn = Regex.Match(json, "\\\"asn\\\"\\s*:\\s*\\\"?(?:AS)?(\\d+)", RegexOptions.IgnoreCase); // the service sends "asn":"6805" (quoted)
                     Match name = Regex.Match(json, "\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
                     string result = NormalizeProvider(name.Success ? name.Groups[1].Value : "Unknown ISP") +
                         (asn.Success ? " · AS" + asn.Groups[1].Value : "");
@@ -154,7 +172,11 @@ namespace LagWatch
             if (value.Contains("CENTURYLINK") || value.Contains("QWEST") || value.Contains("LUMEN")) return "CenturyLink / Lumen";
             if (value.Contains("FRONTIER")) return "Frontier";
             if (value.Contains("T-MOBILE") || value.Contains("TMOBILE")) return "T-Mobile";
-            return String.IsNullOrWhiteSpace(raw) ? "Unknown ISP" : raw.Split('-')[0].Trim();
+            if (String.IsNullOrWhiteSpace(raw)) return "Unknown ISP";
+            // Registry names look like "TDDE-ASN1 Telefonica Germany GmbH & Co.OHG": prefer the organisation after the handle.
+            Match org = Regex.Match(raw.Trim(), "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\\s+(?:-\\s+)?(.+)$");
+            if (org.Success) return org.Groups[1].Value.Trim();
+            return raw.Split('-')[0].Trim();
         }
 
         private static async Task<string> QueryIodaWithCacheAsync(string isp)
@@ -167,16 +189,16 @@ namespace LagWatch
                 using (WebClient client = NewClient())
                 {
                     long until = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); long from = until - 86400;
-                    string json = await client.DownloadStringTaskAsync("https://api.ioda.inetintel.cc.gatech.edu/v2/outages/alerts/asn/" + asn.Groups[1].Value + "?from=" + from + "&until=" + until);
-                    bool empty = Regex.IsMatch(json, "\\\"data\\\"\\s*:\\s*\\[\\s*\\]");
-                    int count = Regex.Matches(json, "\\\"score\\\"\\s*:").Count;
-                    string result = empty || count == 0 ? "NO IODA ASN OUTAGE ALERTS IN LAST 24 HOURS" : count + " FREE IODA OUTAGE ALERT SIGNAL(S) RETURNED";
+                    string json = await client.DownloadStringTaskAsync(ProviderOutageFeed.AlertsUrl(asn.Groups[1].Value, from, until));
+                    int count = ProviderOutageFeed.CountProblems(json);
+                    string result = count == 0 ? "NO OUTAGE ALERTS FOR YOUR PROVIDER IN THE LAST 24 HOURS"
+                        : count + " OUTAGE ALERT" + (count == 1 ? "" : "S") + " FOR YOUR PROVIDER IN THE LAST 24 HOURS (IODA)";
                     File.WriteAllText(cache, DateTime.Now.ToString("o") + Environment.NewLine + result); return result;
                 }
             }
             catch
             {
-                if (!File.Exists(cache)) return "OFFLINE · no cached global-outage result";
+                if (!File.Exists(cache)) return "UNAVAILABLE · couldn't reach the IODA outage monitor";
                 string[] lines = File.ReadAllLines(cache); DateTime saved;
                 string age = lines.Length > 0 && DateTime.TryParse(lines[0], out saved) ? " · cached " + (int)(DateTime.Now - saved).TotalHours + "h ago" : " · cached";
                 return (lines.Length > 1 ? lines[1] : "Last global result unavailable") + age;
@@ -197,7 +219,7 @@ namespace LagWatch
             Directory.CreateDirectory(directory); return Path.Combine(directory, name);
         }
 
-        private static WebClient NewClient()
+        internal static WebClient NewClient()
         {
             ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
             WebClient client = new WebClient(); client.Headers[HttpRequestHeader.UserAgent] = "LagWatch-Dev/1.0"; return client;
@@ -224,56 +246,15 @@ namespace LagWatch
         }
 
         private static Label MakeLabel(string text, int left, int top, float size, Color color)
-        { return new Label { Text = text, AutoSize = true, Location = new Point(left, top), Font = new Font("Segoe UI Semibold", size), ForeColor = color }; }
+        { return new Label { Text = text, AutoSize = true, Location = new Point(left, top), Font = Theme.UiFont(size, true), ForeColor = color }; }
         private static void AddCaption(Control card, string text, int top) { card.Controls.Add(MakeLabel(text, 20, top, 8, Theme.TextFaint)); }
         private static Label AddValue(Control card, string text, int top)
         {
-            Label label = MakeLabel(text, 210, top - 2, 9.5f, Theme.Text); label.AutoSize = false; label.Width = 450; label.Height = 25;
+            // Room for two lines (longer messages wrap instead of being cut off), then "…" if there's still more.
+            Label label = MakeLabel(text, 210, top - 2, 9.5f, Theme.Text); label.AutoSize = false; label.Width = 450; label.Height = 46;
+            label.AutoEllipsis = true; label.UseMnemonic = false;
             label.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; card.Controls.Add(label); return label;
         }
     }
 
-    internal sealed class OutageHistory
-    {
-        private readonly string path;
-        public OutageHistory()
-        {
-            string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LagWatch");
-            Directory.CreateDirectory(directory); path = Path.Combine(directory, "outage-events.csv");
-        }
-
-        public void Record(DateTime timestamp, string diagnosis)
-        {
-            Prune(timestamp.AddDays(-30));
-            if (diagnosis == "HEALTHY") return;
-            string last = File.Exists(path) ? File.ReadLines(path).LastOrDefault() : null;
-            DateTime previous;
-            if (last != null && DateTime.TryParse(last.Split(',')[0], out previous) && timestamp - previous < TimeSpan.FromMinutes(15)) return;
-            if (!File.Exists(path)) File.WriteAllText(path, "timestamp,classification" + Environment.NewLine);
-            File.AppendAllText(path, timestamp.ToString("o") + "," + diagnosis + Environment.NewLine);
-        }
-
-        public string GetRecurringWarning(DateTime now)
-        {
-            if (!File.Exists(path)) return "no recurring local outage pattern learned yet";
-            int matches = 0; var days = new System.Collections.Generic.HashSet<DateTime>();
-            foreach (string line in File.ReadLines(path).Skip(1))
-            {
-                DateTime timestamp; if (!DateTime.TryParse(line.Split(',')[0], out timestamp)) continue;
-                double distance = Math.Abs((timestamp.TimeOfDay - now.TimeOfDay).TotalMinutes); distance = Math.Min(distance, 1440 - distance);
-                if (timestamp.Date != now.Date && distance <= 30) { matches++; days.Add(timestamp.Date); }
-            }
-            return matches >= 3 && days.Count >= 3
-                ? "elevated recurring-outage risk near this time (" + matches + " events across " + days.Count + " days)"
-                : "learning · " + matches + " matching prior event(s), requires 3 days";
-        }
-
-        private void Prune(DateTime cutoff)
-        {
-            if (!File.Exists(path)) return;
-            string[] retained = File.ReadLines(path).Skip(1).Where(line =>
-            { DateTime timestamp; return DateTime.TryParse(line.Split(',')[0], out timestamp) && timestamp >= cutoff; }).ToArray();
-            File.WriteAllLines(path, new[] { "timestamp,classification" }.Concat(retained).ToArray());
-        }
-    }
 }

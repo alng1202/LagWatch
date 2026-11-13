@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -23,6 +23,15 @@ namespace LagWatch
                      ControlStyles.UserPaint, true);
         }
 
+        private ForecastSlot usual;
+
+        /// <summary>Plus: the usual latency at this time of day, drawn as a dashed line over a shaded typical range.</summary>
+        public void SetUsual(ForecastSlot slot)
+        {
+            usual = slot != null && slot.Ready ? slot : null;
+            Invalidate();
+        }
+
         public void SetSamples(IEnumerable<PingSample> values)
         {
             lock (sync)
@@ -40,30 +49,59 @@ namespace LagWatch
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
-            Rectangle area = new Rectangle(48, 16, Math.Max(1, Width - 66), Math.Max(1, Height - 42));
+            // Insets follow the label text size, so the axis and caption fit at any display scaling.
+            int labelWidth, labelHeight;
+            using (Font measureFont = Theme.UiFont(8.5f))
+            {
+                Size measured = TextRenderer.MeasureText(g, "2000 ms", measureFont);
+                labelWidth = measured.Width + Theme.Px(this, 6);
+                labelHeight = measured.Height;
+            }
+            Rectangle area = new Rectangle(labelWidth, labelHeight, Math.Max(1, Width - labelWidth - Theme.Px(this, 16)),
+                Math.Max(1, Height - labelHeight * 2 - Theme.Px(this, 12)));
             List<PingSample> local;
             lock (sync) local = samples.ToList();
 
             long observedMax = local.Where(s => s.Success).Select(s => s.LatencyMs).DefaultIfEmpty(60).Max();
+            ForecastSlot expected = usual;
+            if (expected != null) observedMax = Math.Max(observedMax, (long)Math.Ceiling(expected.HighMs));
             int scaleMax = NiceScale(Math.Max(60, observedMax));
 
             using (Pen gridPen = new Pen(Theme.Grid, 1))
             using (Brush labelBrush = new SolidBrush(Theme.TextFaint))
-            using (Font labelFont = new Font("Segoe UI", 8.5f))
+            using (Font labelFont = Theme.UiFont(8.5f))
             {
                 for (int i = 0; i <= 4; i++)
                 {
                     float y = area.Top + area.Height * i / 4f;
                     g.DrawLine(gridPen, area.Left, y, area.Right, y);
                     int value = (int)Math.Round(scaleMax * (4 - i) / 4.0);
-                    g.DrawString(value + " ms", labelFont, labelBrush, 2, y - 7);
+                    g.DrawString(value + " ms", labelFont, labelBrush, 2, y - labelHeight / 2f);
+                }
+            }
+
+            if (expected != null)
+            {
+                Func<double, float> yFor = ms => area.Bottom - (float)Math.Min(1.0, ms / scaleMax) * area.Height;
+                float bandTop = yFor(expected.HighMs), bandBottom = yFor(expected.LowMs);
+                using (Brush band = new SolidBrush(Color.FromArgb(38, Theme.AccentBlue)))
+                    g.FillRectangle(band, area.Left, bandTop, area.Width, Math.Max(2f, bandBottom - bandTop));
+                float y = yFor(expected.MedianMs);
+                using (Pen dashed = new Pen(Theme.AccentBlue, 1.6f) { DashStyle = DashStyle.Dash })
+                    g.DrawLine(dashed, area.Left, y, area.Right, y);
+                using (Font font = Theme.UiFont(8f, true))
+                using (Brush brush = new SolidBrush(Theme.AccentBlue))
+                {
+                    string label = "usual now ≈ " + expected.MedianMs.ToString("0") + " ms";
+                    SizeF size = g.MeasureString(label, font);
+                    g.DrawString(label, font, brush, area.Left + Theme.Px(this, 4), Math.Max(area.Top, y - size.Height - 1));
                 }
             }
 
             if (local.Count == 0)
             {
                 using (Brush brush = new SolidBrush(Theme.TextMuted))
-                using (Font font = new Font("Segoe UI", 11f))
+                using (Font font = Theme.UiFont(11f))
                 {
                     string message = "Start monitoring to see live route quality";
                     SizeF size = g.MeasureString(message, font);
@@ -131,8 +169,11 @@ namespace LagWatch
             }
 
             using (Brush brush = new SolidBrush(Theme.TextFaint))
-            using (Font font = new Font("Segoe UI", 8.5f))
-                g.DrawString("last 2 minutes", font, brush, area.Right - 82, area.Bottom + 7);
+            using (Font font = Theme.UiFont(8.5f))
+            {
+                SizeF caption = g.MeasureString("last 2 minutes", font);
+                g.DrawString("last 2 minutes", font, brush, area.Right - caption.Width, area.Bottom + Theme.Px(this, 6));
+            }
         }
 
         private static int NiceScale(long observed)

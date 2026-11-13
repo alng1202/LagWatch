@@ -13,39 +13,25 @@ using System.Threading.Tasks;
 
 namespace LagWatch
 {
-    internal enum SubscriptionTier
-    {
-        Free,
-        Basic,
-        Pro
-    }
-
-    internal static class SubscriptionPolicy
-    {
-        public static bool CanUsePredictions(SubscriptionTier tier) { return (int)tier >= (int)SubscriptionTier.Basic; }
-        public static bool CanExportHistory(SubscriptionTier tier) { return (int)tier >= (int)SubscriptionTier.Basic; }
-        public static bool CanUseAdvancedDiagnostics(SubscriptionTier tier) { return (int)tier >= (int)SubscriptionTier.Pro; }
-        public static bool CanPreviewAdaptiveControl(SubscriptionTier tier) { return (int)tier >= (int)SubscriptionTier.Pro; }
-
-        public static string Summary(SubscriptionTier tier)
-        {
-            switch (tier)
-            {
-                case SubscriptionTier.Basic:
-                    return "Predictions and session exports unlocked";
-                case SubscriptionTier.Pro:
-                    return "Advanced diagnostics and adaptive-control preview unlocked";
-                default:
-                    return "Monitoring, game detection, graph, and Safe Optimize";
-            }
-        }
-    }
+    // SubscriptionTier and SubscriptionPolicy live in Doctor/Tiers.cs (Free / Plus / Pro).
 
     internal sealed class PingSample
     {
         public DateTime Timestamp { get; set; }
         public bool Success { get; set; }
         public long LatencyMs { get; set; }
+    }
+
+    internal sealed class PingTargetOption
+    {
+        public string DisplayName { get; set; }
+        public string Target { get; set; }
+        public bool IsLocalGateway { get; set; }
+
+        public override string ToString()
+        {
+            return DisplayName;
+        }
     }
 
     internal sealed class NetworkSnapshot
@@ -59,6 +45,52 @@ namespace LagWatch
         public long MinimumMs { get; set; }
         public long MaximumMs { get; set; }
         public string Quality { get; set; }
+    }
+
+    internal sealed class NetworkUsage
+    {
+        public double DownloadMbps { get; set; }
+        public double UploadMbps { get; set; }
+    }
+
+    /// <summary>Measures aggregate active-adapter throughput between samples; it does not inspect packet contents.</summary>
+    internal sealed class NetworkUsageSampler
+    {
+        private DateTime previousAt;
+        private long previousReceived;
+        private long previousSent;
+
+        public NetworkUsage Sample()
+        {
+            try
+            {
+                long received = 0, sent = 0;
+                foreach (NetworkInterface adapter in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (adapter.OperationalStatus != OperationalStatus.Up ||
+                        adapter.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                        adapter.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
+                    IPv4InterfaceStatistics stats = adapter.GetIPv4Statistics();
+                    received += stats.BytesReceived;
+                    sent += stats.BytesSent;
+                }
+                DateTime now = DateTime.UtcNow;
+                double seconds = previousAt == default(DateTime) ? 0 : Math.Max(0.1, (now - previousAt).TotalSeconds);
+                NetworkUsage usage = new NetworkUsage
+                {
+                    DownloadMbps = seconds <= 0 ? 0 : Math.Max(0, received - previousReceived) * 8d / seconds / 1000000d,
+                    UploadMbps = seconds <= 0 ? 0 : Math.Max(0, sent - previousSent) * 8d / seconds / 1000000d
+                };
+                previousAt = now;
+                previousReceived = received;
+                previousSent = sent;
+                return usage;
+            }
+            catch
+            {
+                return new NetworkUsage();
+            }
+        }
     }
 
     internal static class StatisticsCalculator
@@ -621,6 +653,28 @@ namespace LagWatch
 
     internal static class NetworkDiagnostics
     {
+        public static string GetDefaultGateway()
+        {
+            try
+            {
+                return NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(n => n.OperationalStatus == OperationalStatus.Up)
+                    .Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                                n.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                    .OrderByDescending(HasGateway)
+                    .ThenByDescending(n => n.Speed)
+                    .SelectMany(n => n.GetIPProperties().GatewayAddresses)
+                    .Select(g => g.Address)
+                    .Where(a => a != null && !IPAddress.Any.Equals(a) && !IPAddress.IPv6Any.Equals(a))
+                    .Select(a => a.ToString())
+                    .FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         public static async Task<DiagnosticReport> AnalyzeAsync(string target)
         {
             NetworkInterface adapter = NetworkInterface.GetAllNetworkInterfaces()
